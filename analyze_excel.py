@@ -196,6 +196,37 @@ HIGH_DEMAND_N_REP = 20
 # 每个措施除了成本，还可以定义对 lambda、mu、T_find、c 的缩放/增量。
 BASE_C = 3  # 基准人工窗口数
 PEAK_SLOTS = ["10:00-12:00", "16:00-18:00"]
+SLOT_LABEL_TRANSLATION = str.maketrans({
+    "－": "-",
+    "–": "-",
+    "—": "-",
+    "﹣": "-",
+    "：": ":",
+})
+
+
+def canonicalize_time_slot_label(label: object) -> str:
+    """标准化时间段字符串，便于匹配高峰时段。"""
+
+    if pd.isna(label):
+        text = ""
+    else:
+        text = str(label)
+    text = text.strip().translate(SLOT_LABEL_TRANSLATION)
+    text = re.sub(r"\s+", "", text)
+    return text
+
+
+PEAK_SLOT_CANONICALS = {
+    canonicalize_time_slot_label(slot) for slot in PEAK_SLOTS
+}
+
+
+def peak_slot_mask(series: pd.Series) -> pd.Series:
+    """返回一个布尔掩码，标识给定序列中的高峰时段。"""
+
+    normalized = series.astype(str).map(canonicalize_time_slot_label)
+    return normalized.isin(PEAK_SLOT_CANONICALS)
 DEFAULT_T_FIND_MIN = 4.0  # 分钟
 DEFAULT_MACHINE_COUNT = 2
 DEFAULT_MACHINE_MU_FACTOR = 2.0
@@ -818,7 +849,7 @@ def apply_measures(base_df: pd.DataFrame, x: object) -> Tuple[pd.DataFrame, floa
     if flags["x5"]:
         peak_factor = MEASURES["x5"].get("lambda_peak_factor", 1.0)
         off_factor = MEASURES["x5"].get("lambda_off_factor", 1.0)
-        peak_mask = df["time_slot"].isin(PEAK_SLOTS)
+        peak_mask = peak_slot_mask(df["time_slot"])
         lambda_new = np.where(
             peak_mask,
             lambda_series * peak_factor,
@@ -834,7 +865,7 @@ def apply_measures(base_df: pd.DataFrame, x: object) -> Tuple[pd.DataFrame, floa
     c_manual = c_manual + delta_staff
     peak_delta = sum(MEASURES[key].get("peak_delta_staff", 0.0) * flags[key] for key in flags)
     if peak_delta:
-        peak_mask = df["time_slot"].isin(PEAK_SLOTS)
+        peak_mask = peak_slot_mask(df["time_slot"])
         c_manual = c_manual.where(~peak_mask, c_manual + peak_delta)
     df["c_manual"] = c_manual
 
@@ -1471,7 +1502,8 @@ def run_q2_scenario_examples(base_df: pd.DataFrame) -> None:
         print(f"措施组合：{measure_desc}")
         print(f"实施成本约为 {total_cost:,.0f} 元。")
 
-        peak_subset = new_df[new_df["time_slot"].isin(PEAK_SLOTS)]
+        peak_mask = peak_slot_mask(new_df["time_slot"])
+        peak_subset = new_df[peak_mask]
         target_subset = peak_subset if not peak_subset.empty else new_df
         summary_cols = ["time_slot"] + numeric_cols
         formatters = {"time_slot": str}
@@ -1720,8 +1752,7 @@ def apply_lambda_factor(
     df = params_df.copy()
     slot_mask = pd.Series(True, index=df.index)
     if peak_only:
-        normalized_slots = df["time_slot"].astype(str).str.strip()
-        slot_mask = normalized_slots.isin(PEAK_SLOTS)
+        slot_mask = peak_slot_mask(df["time_slot"])
     df.loc[slot_mask, "lambda"] = df.loc[slot_mask, "lambda"].astype(float) * float(
         factor
     )

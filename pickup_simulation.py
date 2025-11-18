@@ -137,7 +137,13 @@ class StudentRecord:
 class ServerSystem:
     """封装 SimPy 资源、到达/服务进程及统计逻辑。"""
 
-    def __init__(self, env: simpy.Environment, params_df: pd.DataFrame) -> None:
+    def __init__(
+        self,
+        env: simpy.Environment,
+        params_df: pd.DataFrame,
+        rng: np.random.Generator,
+        max_time: float,
+    ) -> None:
         self.env = env
         self.params_df = prepare_params_table(params_df)
         initial_capacity = max(1, int(round(self.params_df.iloc[0]["c"])))
@@ -145,6 +151,10 @@ class ServerSystem:
         self.student_records: List[StudentRecord] = []
         self.queue_monitor: List[Dict[str, float]] = []
         self._slot_records = self.params_df.to_dict("records")
+        self._target_capacity = initial_capacity
+        self.arrivals_finished = False
+        self.rng = rng
+        self.max_time = max_time
 
     def get_current_slot_params(self, t: float) -> Dict[str, float]:
         """根据当前时间返回对应时段的参数。"""
@@ -153,12 +163,17 @@ class ServerSystem:
                 return slot
         return self._slot_records[-1]
 
-    def _apply_capacity(self, slot_params: Dict[str, float]) -> None:
-        target_capacity = max(1, int(round(slot_params["c"])))
-        if target_capacity != self.server.capacity:
-            # 若调低至小于当前在服人数，则保持现状直到有人完成服务
-            adjusted_capacity = max(target_capacity, self.server.count)
+    def _set_capacity_target(self, slot_params: Dict[str, float]) -> None:
+        self._target_capacity = max(1, int(round(slot_params["c"])))
+        self._enforce_capacity()
+
+    def _enforce_capacity(self) -> None:
+        adjusted_capacity = max(self._target_capacity, self.server.count)
+        if adjusted_capacity != self.server.capacity:
             self.server.capacity = adjusted_capacity
+
+    def is_idle(self) -> bool:
+        return self.server.count == 0 and not self.server.queue
 
     def student_process(self, student_id: int):
         """单个学生的取件流程。"""
@@ -167,7 +182,7 @@ class ServerSystem:
         find_time = float(slot_params["T_find"])
         yield self.env.timeout(find_time)  # 确定性找件时间
         queue_enter = self.env.now
-        self._apply_capacity(slot_params)
+        self._set_capacity_target(slot_params)
         with self.server.request() as req:
             yield req
             wait_time = self.env.now - queue_enter
@@ -176,8 +191,9 @@ class ServerSystem:
             if mu_i <= 0:
                 raise ValueError("mu 必须为正数，表示每台服务器的服务率")
             service_mean = 60.0 / mu_i
-            service_time = float(np.random.exponential(service_mean))
+            service_time = float(self.rng.exponential(service_mean))
             yield self.env.timeout(service_time)
+        self._enforce_capacity()
         end_time = self.env.now
         self.student_records.append(
             StudentRecord(
@@ -194,16 +210,19 @@ class ServerSystem:
     def arrival_process(self):
         """分时段生成到达事件。"""
         student_id = 1
+        horizon = float(self.max_time)
         for slot in self._slot_records:
-            slot_start = slot["slot_start_min"]
-            slot_end = slot["slot_end_min"]
+            slot_start = min(slot["slot_start_min"], horizon)
+            slot_end = min(slot["slot_end_min"], horizon)
+            if slot_start >= horizon:
+                break
             lambda_min = float(slot["lambda_per_min"])
 
             # 若当前时间早于该时段，直接前进
             if self.env.now < slot_start:
                 yield self.env.timeout(slot_start - self.env.now)
 
-            self._apply_capacity(slot)
+            self._set_capacity_target(slot)
 
             while self.env.now < slot_end:
                 if lambda_min <= 0:
@@ -211,7 +230,7 @@ class ServerSystem:
                     if remaining > 0:
                         yield self.env.timeout(remaining)
                     break
-                inter_arrival = float(np.random.exponential(1.0 / lambda_min))
+                inter_arrival = float(self.rng.exponential(1.0 / lambda_min))
                 if self.env.now + inter_arrival > slot_end:
                     remaining = slot_end - self.env.now
                     if remaining > 0:
@@ -220,6 +239,7 @@ class ServerSystem:
                 yield self.env.timeout(inter_arrival)
                 self.env.process(self.student_process(student_id))
                 student_id += 1
+        self.arrivals_finished = True
 
     def monitor_queue(self, interval: float = 1.0):
         """周期性记录队列状态，供后续可视化。"""
@@ -230,11 +250,15 @@ class ServerSystem:
                 "in_service": self.server.count,
             }
             self.queue_monitor.append(record)
+            if self.arrivals_finished and self.is_idle():
+                return
             yield self.env.timeout(interval)
 
 
 def run_single_replication(
-    params_df: pd.DataFrame, random_seed: int = 0, max_time: float = 720.0
+    params_df: pd.DataFrame,
+    random_seed: Optional[int] = None,
+    max_time: float = 720.0,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """运行一次 Q3 仿真：返回学生层统计与队列监控。
 
@@ -247,12 +271,17 @@ def run_single_replication(
         queue_monitor_df: 按固定间隔记录的队列长度与在服人数。
     """
 
-    np.random.seed(random_seed)
+    if random_seed is None:
+        rng = np.random.default_rng()
+    else:
+        rng = np.random.default_rng(random_seed)
     env = simpy.Environment()
-    system = ServerSystem(env, params_df)
+    system = ServerSystem(env, params_df, rng=rng, max_time=max_time)
     env.process(system.arrival_process())
     env.process(system.monitor_queue())
     env.run(until=max_time)
+    if not system.is_idle():
+        env.run()
 
     stats_df = pd.DataFrame([record.__dict__ for record in system.student_records])
     if not stats_df.empty:

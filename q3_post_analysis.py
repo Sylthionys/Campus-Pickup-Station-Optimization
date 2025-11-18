@@ -177,7 +177,14 @@ def plot_queue_compare(queue_data: Dict[str, pd.DataFrame]) -> None:
     for label, df in queue_data.items():
         if df.empty or "time" not in df.columns:
             continue
-        ax.plot(df["time"], df["queue_length"], label=label)
+        queue_col = None
+        for candidate in ("queue_length", "queue_len"):
+            if candidate in df.columns:
+                queue_col = candidate
+                break
+        if queue_col is None:
+            continue
+        ax.plot(df["time"], df[queue_col], label=label)
     ax.set_xlabel("时间（分钟）")
     ax.set_ylabel("队列长度（人）")
     ax.set_title("不同方案的队列长度对比")
